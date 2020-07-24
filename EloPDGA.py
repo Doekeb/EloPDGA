@@ -20,19 +20,27 @@ header = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHT
 class Updater:
     def __init__(self, dbname):
         self.dbname = dbname
+
+    def __enter__(self):
+        self.conn = ps.connect(dbname=self.dbname, user="postgres")
+        self.cur = self.conn.cursor()
         self.setup()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.cur.close()
+        self.conn.close()
 
     def setup(self):
         """
         Create the database schemas (if they do not already exist)
         """
-        with ps.connect(dbname=self.dbname, user="postgres") as conn, conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                id int,
-                name TEXT
-            )
-            """)
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            id int,
+            name TEXT
+        )
+        """)
 
     def getHTML(self, source):
         """
@@ -77,5 +85,5 @@ class Updater:
 
 
 if __name__ == '__main__':
-    u = Updater(dbname)
-    print(u.getDataFrames(events))
+    with Updater(dbname) as u:
+        print(u.getDataFrames(events))
