@@ -22,30 +22,58 @@ class Updater:
         self.dbname = dbname
 
     def __enter__(self):
-        self.conn = ps.connect(dbname=self.dbname, user="postgres")
-        self.cur = self.conn.cursor()
+        self.connection = ps.connect(dbname=self.dbname, user="postgres")
+        self.cursor = self.connection.cursor()
         self.setup()
         return self
 
     def __exit__(self, type, value, traceback):
-        self.cur.close()
-        self.conn.close()
+        self.cursor.close()
+        self.connection.close()
+
+    def open(self):
+        return self.__enter__()
 
     def setup(self):
         """
         Create the database schemas (if they do not already exist)
         """
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS players (
-            id int,
-            name TEXT
+
+        self.cursor.execute("""
+        BEGIN;
+            CREATE SEQUENCE player_id_decrement
+            INCREMENT BY -1
+            MAXVALUE 0
+            START WITH 0;
+
+            CREATE TABLE players (
+                player_id INT PRIMARY KEY DEFAULT NEXTVAL('player_id_decrement')
+                name TEXT
+            );
+
+            ALTER SEQUENCE player_id_decrement
+            OWNED BY players.player_id;
+        COMMIT;
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id INT PRIMARY KEY,
+            title TEXT,
+            n_rounds INT,
+            tier VARCHAR(10),
+            start_date DATE
+        );
+
+        CREATE TABLE IF NOT EXISTS rounds (
+            event_id INT REFERENCES events(event_id),
+            round_num INT,
+            round_date DATE
         )
         """)
 
     def getHTML(self, source):
         """
-        Get data from source. Input source is a url to a PDGA results page or a PDGA
-        event number (or in the future, a csv file containing round results)
+        Get HTML from source. Input source is a url to a PDGA results page or a PDGA
+        event number
         """
         if source[:len(pdgaSecureHeader)] == pdgaSecureHeader or source[:len(pdgaHeader)] == pdgaHeader:
             try:
@@ -62,26 +90,24 @@ class Updater:
 
         return r
 
-    def getDataFrames(self, sources):
+    def getDataFrames(self, source):
         """
-        Get data from sources. Input sources is a space-separated string or a list
-        of strings, each being a url to a PDGA results page or a PDGA event number
-        (or in the future, a csv file containing round results)
+        Get data from source. Input source is a url to a PDGA results page or a
+        PDGA event number (or in the future, a csv file containing round
+        results)
         """
-        if type(sources) == str:
-            self.sources = sources.split()
-        else:
-            self.sources = sources
+        # First "table" on each results page doesn't conatin useful information
+        return pd.read_html(self.getHTML(source).text, header=0, keep_default_na=False)[1:]
 
-        tables = []
-
-        if type(sources) == str:
-            sources = sources.split()
-
-        for source in sources:
-            tables += pd.read_html(self.getHTML(source).text, header=0, keep_default_na=False)[1:]
-
-        return tables
+    def update(self, source):
+        """
+        Update database with data from source. Input source is a url to a PDGA
+        results page or a PDGA event number (or in the future, a csv file
+        containing round results)
+        """
+        pass
+        # for table in self.getDataFrames(source):
+        #     columns = ["Name", "PDGA#"]
 
 
 if __name__ == '__main__':
