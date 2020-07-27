@@ -3,10 +3,11 @@
 import requests
 import pandas as pd
 import psycopg2 as ps
+import psycopg2.extras as extras
 
 # TEST VARIABLES
 url = "https://www.pdga.com/tour/event/45744"
-events = "45744 45745"
+event = "45744"
 dbname = "Elo"
 # END TEST VARIABLES
 
@@ -40,20 +41,18 @@ class Updater:
         """
 
         self.cursor.execute("""
-        BEGIN;
-            CREATE SEQUENCE player_id_decrement
-            INCREMENT BY -1
-            MAXVALUE 0
-            START WITH 0;
+        CREATE SEQUENCE IF NOT EXISTS player_id_decrement
+        INCREMENT BY -1
+        MAXVALUE 0
+        START WITH 0;
 
-            CREATE TABLE players (
-                player_id INT PRIMARY KEY DEFAULT NEXTVAL('player_id_decrement')
-                name TEXT
-            );
+        CREATE TABLE IF NOT EXISTS players (
+            player_id INT PRIMARY KEY DEFAULT NEXTVAL('player_id_decrement'),
+            name TEXT
+        );
 
-            ALTER SEQUENCE player_id_decrement
-            OWNED BY players.player_id;
-        COMMIT;
+        ALTER SEQUENCE player_id_decrement
+        OWNED BY players.player_id;
 
         CREATE TABLE IF NOT EXISTS events (
             event_id INT PRIMARY KEY,
@@ -69,6 +68,7 @@ class Updater:
             round_date DATE
         )
         """)
+        self.connection.commit()
 
     def getHTML(self, source):
         """
@@ -96,8 +96,46 @@ class Updater:
         PDGA event number (or in the future, a csv file containing round
         results)
         """
+        return [table.filter(regex="PDGA#|Name|Rd.*") for table in
+                pd.read_html(self.getHTML(source).text,
+                             header=0,
+                             keep_default_na=False)[1:]]
         # First "table" on each results page doesn't conatin useful information
-        return pd.read_html(self.getHTML(source).text, header=0, keep_default_na=False)[1:]
+
+
+    def update_players(self, table):
+        for row in range(len(table)):
+
+            id, name = map(str, table[["PDGA#", "Name"]].iloc[row])
+
+            if id == "": # If the person has no PDGA# yet
+
+                # We will use the result of this line to see if the person is already in the database and if so, get their id number
+                self.cursor.execute("""
+                SELECT player_id FROM players
+                WHERE name = %s AND player_id <= 0
+                """, (name,))
+
+                # If next line is None, then the person doesn't exist in the database
+                existing_id = self.cursor.fetchone()
+
+                if existing_id:
+                    table.at[row, "PDGA#"] = existing_id
+
+                else:
+                    self.cursor.execute("""
+                    INSERT INTO players (name)
+                    VALUES (%s)
+                    """, (name,))
+
+            else: # The case when the person already has a PDGA#
+                self.cursor.execute("""
+                INSERT INTO players
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+                """, (id, name))
+
+        self.connection.commit()
 
     def update(self, source):
         """
@@ -105,11 +143,10 @@ class Updater:
         results page or a PDGA event number (or in the future, a csv file
         containing round results)
         """
-        pass
-        # for table in self.getDataFrames(source):
-        #     columns = ["Name", "PDGA#"]
+        for table in self.getDataFrames(source):
+            self.update_players(table)
 
 
 if __name__ == '__main__':
     with Updater(dbname) as u:
-        print(u.getDataFrames(events))
+        u.update(event)
