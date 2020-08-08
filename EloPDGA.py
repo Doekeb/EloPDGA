@@ -3,18 +3,9 @@
 import requests
 import pandas as pd
 import psycopg2 as ps
-import psycopg2.extras as extras
 from bs4 import BeautifulSoup
 import datetime as dt
 import re
-import io
-
-# TEST VARIABLES
-url = "https://www.pdga.com/tour/event/45744"
-event = "45744"
-events = ["45744", "45745"]
-dbname = "Elo"
-# END TEST VARIABLES
 
 # CONSTANTS
 pdgaSecureHeader = "https://www.pdga.com/tour/event/"
@@ -181,7 +172,6 @@ class Updater:
 
         return event_id
 
-    # WORKING ON THIS METHOD
     def update_event(self, table, event_id):
         t = table.filter(regex="PDGA#|Rd").replace(("888", "999"), "")
         n_entries = len(t.columns)
@@ -213,7 +203,5 @@ class Updater:
                 self.update_players(table)
                 self.update_event(table, event_id) # Update the table specific to *this* event
 
-
-if __name__ == '__main__':
-    with Updater(dbname) as u:
-        u.update("45744", "45745")
+class Calculator:
+    pass
