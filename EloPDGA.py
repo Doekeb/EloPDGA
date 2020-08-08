@@ -4,10 +4,15 @@ import requests
 import pandas as pd
 import psycopg2 as ps
 import psycopg2.extras as extras
+from bs4 import BeautifulSoup
+import datetime as dt
+import re
+import io
 
 # TEST VARIABLES
 url = "https://www.pdga.com/tour/event/45744"
 event = "45744"
+events = ["45744", "45745"]
 dbname = "Elo"
 # END TEST VARIABLES
 
@@ -16,6 +21,7 @@ pdgaSecureHeader = "https://www.pdga.com/tour/event/"
 pdgaHeader = "http://www.pdga.com/tour/event/"
 header = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.75 Safari/537.36",
           "X-Requested-With": "XMLHttpRequest"}
+date_junk = '<strong>Date</strong>: '
 # END CONSTANTS
 
 class Updater:
@@ -43,8 +49,8 @@ class Updater:
         self.cursor.execute("""
         CREATE SEQUENCE IF NOT EXISTS player_id_decrement
         INCREMENT BY -1
-        MAXVALUE 0
-        START WITH 0;
+        MAXVALUE -1
+        START WITH -1;
 
         CREATE TABLE IF NOT EXISTS players (
             player_id INT PRIMARY KEY DEFAULT NEXTVAL('player_id_decrement'),
@@ -57,15 +63,9 @@ class Updater:
         CREATE TABLE IF NOT EXISTS events (
             event_id INT PRIMARY KEY,
             title TEXT,
-            n_rounds INT,
-            tier VARCHAR(10),
-            start_date DATE
-        );
-
-        CREATE TABLE IF NOT EXISTS rounds (
-            event_id INT REFERENCES events(event_id),
-            round_num INT,
-            round_date DATE
+            tier TEXT,
+            start_date DATE,
+            n_rounds INT
         )
         """)
         self.connection.commit()
@@ -90,22 +90,22 @@ class Updater:
 
         return r
 
-    def getDataFrames(self, source):
+    def getDataFrames(self, html):
         """
         Get data from source. Input source is a url to a PDGA results page or a
         PDGA event number (or in the future, a csv file containing round
         results)
         """
-        return [table.filter(regex="PDGA#|Name|Rd.*") for table in
-                pd.read_html(self.getHTML(source).text,
-                             header=0,
-                             keep_default_na=False)[1:]]
+        return [table.filter(regex="PDGA#|Name|Rd") for table in
+                pd.read_html(html, header=0, keep_default_na=False)[1:]]
         # First "table" on each results page doesn't conatin useful information
 
 
     def update_players(self, table):
-        for row in range(len(table)):
+        if "PDGA#" not in table.columns:
+            table.insert(1, "PDGA#", "")
 
+        for row in range(len(table)):
             id, name = map(str, table[["PDGA#", "Name"]].iloc[row])
 
             if id == "": # If the person has no PDGA# yet
@@ -116,17 +116,22 @@ class Updater:
                 WHERE name = %s AND player_id <= 0
                 """, (name,))
 
-                # If next line is None, then the person doesn't exist in the database
                 existing_id = self.cursor.fetchone()
 
-                if existing_id:
-                    table.at[row, "PDGA#"] = existing_id
-
-                else:
+                if existing_id == None:
                     self.cursor.execute("""
                     INSERT INTO players (name)
                     VALUES (%s)
                     """, (name,))
+
+                    self.cursor.execute("""
+                    SELECT player_id FROM players
+                    WHERE name = %s AND player_id <= 0
+                    """, (name,))
+
+                    existing_id = self.cursor.fetchone()
+
+                table.at[row, "PDGA#"] = existing_id[0]
 
             else: # The case when the person already has a PDGA#
                 self.cursor.execute("""
@@ -137,16 +142,78 @@ class Updater:
 
         self.connection.commit()
 
-    def update(self, source):
+    def update_events(self, html):
+        soup = BeautifulSoup(html, "lxml")
+
+        title = soup.find("meta", property="og:title")["content"]
+        event_id = int(soup.find("meta", property="og:url")["content"][len(pdgaSecureHeader):])
+        tier = soup.find("h4").decode_contents()
+
+        months = {"Jan": 1, "Feb": 2, "Mar": 3,
+                  "Apr": 4, "May": 5, "Jun": 6,
+                  "Jul": 7, "Aug": 8, "Sep": 9,
+                  "Oct": 10, "Nov": 11, "Dec": 12}
+        dates = soup.find("li", attrs={"class":"tournament-date"}).decode_contents()[len(date_junk):]
+        start_date = dt.date(int(dates[-4:]), months[dates[3:6]], int(dates[:2]))
+
+        n_rounds = int(soup.find_all(string=re.compile("Rd[0-9]"))[-1][2:])
+
+        self.cursor.execute("""
+        INSERT INTO events
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        """, (event_id, title, tier, start_date, n_rounds))
+
+        self.connection.commit()
+
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_%s (
+            player_id INT REFERENCES players(player_id) UNIQUE
+        )""", (event_id,))
+
+        for n in range(1, n_rounds+1):
+            self.cursor.execute("""
+            ALTER TABLE IF EXISTS event_%s
+            ADD COLUMN IF NOT EXISTS round_%s INT
+            """, (event_id, n))
+
+        self.connection.commit()
+
+        return event_id
+
+    # WORKING ON THIS METHOD
+    def update_event(self, table, event_id):
+        t = table.filter(regex="PDGA#|Rd").replace(("888", "999"), "")
+        n_entries = len(t.columns)
+        substitution_string = "(" + ", ".join(("%s",) * n_entries) + ")"
+        update_string = ", ".join(["round_%s = COALESCE(excluded.round_%s, event.round_%s)" % (i, i, i)
+                                   for i in range(1, n_entries)])
+        for row in range(len(t)):
+            self.cursor.execute("""
+            INSERT INTO event_%s as event
+            VALUES %s
+            ON CONFLICT (player_id) DO
+            UPDATE SET %s
+            """ % (event_id, substitution_string, update_string), tuple(map(lambda x: int(x) if x else None, t.iloc[row])))
+
+        self.connection.commit()
+
+    def update(self, *sources):
         """
         Update database with data from source. Input source is a url to a PDGA
         results page or a PDGA event number (or in the future, a csv file
         containing round results)
         """
-        for table in self.getDataFrames(source):
-            self.update_players(table)
+        for source in sources:
+            html = self.getHTML(source).text
+
+            event_id = self.update_events(html) # Update the "events" table
+
+            for table in self.getDataFrames(html):
+                self.update_players(table)
+                self.update_event(table, event_id) # Update the table specific to *this* event
 
 
 if __name__ == '__main__':
     with Updater(dbname) as u:
-        u.update(event)
+        u.update("45744", "45745")
