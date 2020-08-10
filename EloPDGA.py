@@ -6,6 +6,9 @@ import psycopg2 as ps
 from bs4 import BeautifulSoup
 import datetime as dt
 import re
+import numpy as np
+
+pd.set_option('display.max_rows', None)
 
 # CONSTANTS
 pdgaSecureHeader = "https://www.pdga.com/tour/event/"
@@ -204,4 +207,95 @@ class Updater:
                 self.update_event(table, event_id) # Update the table specific to *this* event
 
 class Calculator:
-    pass
+    def __init__(self, dbname, k_factor=32, initial_rating=1000, field_size_multiplier=None):
+        self.dbname = dbname
+        self.k_factor = k_factor
+        self.initial_rating = np.float64(initial_rating)
+        if field_size_multiplier:
+            self.fsm = field_size_multiplier
+        else:
+            self.fsm = lambda x: x**2 / 10
+
+    def __enter__(self):
+        self.connection = ps.connect(dbname=self.dbname, user="postgres")
+        self.cursor = self.connection.cursor()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.cursor.close()
+        self.connection.close()
+
+    def get_event_info(self, *events):
+        self.cursor.execute("""
+        SELECT event_id, n_rounds FROM events
+        WHERE event_id IN %s
+        ORDER BY start_date, n_rounds
+        """, (events,))
+        return pd.DataFrame(self.cursor.fetchall()).set_index(0)
+
+    def get_result_weights(self, event, round):
+        self.cursor.execute("""
+        SELECT player_id FROM event_%s
+        WHERE round_%s IS NOT NULL
+        ORDER BY round_%s
+        """, (event, round, round))
+
+        players = pd.Index([item[0] for item in self.cursor.fetchall()])
+        n_players = len(players)
+
+        places = np.linspace(n_players - 1, 0, n_players) * self.fsm(n_players) / ((n_players * (n_players - 1))/2)
+
+        self.cursor.execute("""
+        SELECT COUNT(*) FROM event_%s
+        WHERE round_%s IS NOT NULL
+        GROUP BY round_%s
+        ORDER BY round_%s
+        """, (event, round, round, round))
+
+        n_ties = self.cursor.fetchone()
+
+        i = 0
+        while n_ties:
+            n_ties = n_ties[0]
+            places[i : i + n_ties] = [np.average(places[i : i + n_ties])] * n_ties
+            i += n_ties
+            n_ties = self.cursor.fetchone()
+
+        return pd.Series(places, index=players)
+
+    def calculate_round(self, event, round):
+        actual_results = self.get_result_weights(event, round)
+        n_players = len(actual_results)
+        old_ratings = self.ratings.filter(actual_results.index, axis=0).iloc[:,-1]
+        expected_results = self.fsm(n_players) * old_ratings / sum(old_ratings)
+        new_ratings = old_ratings + self.k_factor * (actual_results - expected_results)
+        new_ratings.name = old_ratings.name + 1
+
+        self.ratings[old_ratings.name + 1] = self.ratings[old_ratings.name]
+        self.ratings.update(new_ratings)
+
+    def get_players(self, event):
+        self.cursor.execute("""
+        SELECT DISTINCT player_id FROM event_%s
+        """, (event,))
+
+        players = pd.Index([item[0] for item in self.cursor.fetchall()])
+
+        self.players = self.players.union(players, sort=False)
+
+    def calculate(self, *events):
+        events = self.get_event_info(*events)
+
+        self.players = pd.Index([])
+
+        for event in events.index:
+            self.get_players(event)
+
+        self.ratings = pd.DataFrame(index=self.players)
+        self.ratings.insert(0, 0, self.initial_rating)
+
+        for event in events.index:
+            for round in range(1, events[1][event] + 1):
+                self.calculate_round(event, round)
+
+        return self.ratings
